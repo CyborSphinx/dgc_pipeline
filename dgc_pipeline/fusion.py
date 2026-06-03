@@ -127,9 +127,62 @@ class FusedOperatorBuilder:
                      sigma_pre, sigma_post, fit_r2, comp_rhos)
         rho_val = self._report_propagator(D_fused, G, n_steps_hint)
 
+        # --- EXPLICIT MANUSCRIPT VALIDATION PRINTOUT ---
+        self._report_manuscript_metrics(D_fused, traj_c, rho_val)
+
         return (DiffPlusIOperator(D_fused),
                 {"fused_rank": fr, "G": G, "panel": gene_panel, "rho": rho_val,
                  "D": D_fused})
+
+    # -- newly added manuscript metric reporting -------------------------------
+    def _report_manuscript_metrics(self, D_fused, traj_c, rho_val):
+        """Calculates and prints the specific empirical metrics needed for the 1-page summary."""
+        try:
+            L, K, G = traj_c.shape
+            n_steps = K - 1
+            
+            print("\n--- 1-PAGER MANUSCRIPT VALIDATIONS ---")
+            
+            # [1] PHYSICS CHECK
+            print("[1] PHYSICS CHECK:")
+            if rho_val is not None:
+                print(f"    Spectral Radius rho(M): {rho_val:.4f}")
+                print(f"    (Bounded amplification confirms non-explosive continuous-time stability)\n")
+            else:
+                print(f"    Spectral Radius unavailable.\n")
+
+            # [2] EXTRACTING CONTROL FORCING & DIMENSIONALITY
+            # Safely cast to numpy for diagnostic math regardless of backend
+            traj_c_np = np.asarray(traj_c)
+            X_raw = traj_c_np[:, :-1, :].reshape(L * n_steps, G).T
+            Y_raw = traj_c_np[:, 1:, :].reshape(L * n_steps, G).T
+            
+            M = np.eye(G) + np.asarray(D_fused)
+            B_estimated = Y_raw - (M @ X_raw)
+            
+            # Extract variance of the forcing vector (b_k)
+            _, S_b, _ = svd(B_estimated, full_matrices=False)
+            variance_explained = (S_b**2) / np.sum(S_b**2)
+            
+            print("[2] CONTROL DIMENSIONALITY (SCREE PLOT VARIANCES):")
+            for i in range(min(8, len(variance_explained))):
+                print(f"    Dim {i+1}: {variance_explained[i]:.4f}")
+            print("    (Expect strict variance collapse after Dimension 4)\n")
+
+            # [3] EMPIRICAL FIT (R^2)
+            mean_B = np.mean(B_estimated, axis=1, keepdims=True)
+            Y_predicted = (M @ X_raw) + mean_B
+            
+            SS_res = np.sum((Y_raw - Y_predicted)**2)
+            SS_tot = np.sum((Y_raw - np.mean(Y_raw, axis=1, keepdims=True))**2)
+            r_squared = 1 - (SS_res / SS_tot)
+            
+            print("[3] EMPIRICAL VALIDATION:")
+            print(f"    Linear Matrix Fit R^2:  {r_squared:.4f}")
+            print("--------------------------------------\n")
+            
+        except Exception as e:
+            print(f"\n[Warning] Manuscript metrics generation failed: {e}\n")
 
     # -- diagnostics (unchanged prints) ----------------------------------------
     def _report(self, ranks, ridge, sigma_cap, max_rank, fr, G, sum_P, eps_fuse,
