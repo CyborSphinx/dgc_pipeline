@@ -52,26 +52,102 @@ class FusedOperatorBuilder:
 
     def build(self, traj_c, rank_tol=1e-8, weight="count", gene_panel=None,
               ridge=0.0, n_steps_hint=38, sigma_cap=None, max_rank=None,
-              eps_fuse=0.0):
+              explained_variance_threshold=None,
+              eps_fuse=0.0,
+              pair_lineages=False, pair_indices=None, n_pairs=None,
+              pair_dropout=0.0, pair_seed=0):
+        """
+        Fit a fused operator M = I + D over lineages.
+
+        Two kinds of differencing happen here. Get both right or the model is wrong:
+
+        (1) TIME differencing within each (paired or single) trajectory:
+              DX_k = X_{k+1} - X_k     ->   fit DX = A X   instead of   X' = M X
+            This is for stable low-rank fitting.
+
+        (2) LINEAGE pairing (NEW; off by default for backward compat):
+              y^p_k = traj[I[p], k] - traj[J[p], k]
+              fit on y^p instead of traj[l]
+            By the model x_{k+1} = M x_k + b_k with b_k shared across lineages,
+            taking the lineage difference CANCELS b_k.
+
+        Rank control: two mutually exclusive options
+          - max_rank=K          : every lineage uses the same rank K
+          - explained_variance_threshold=t (in (0,1]) : per-lineage adaptive rank;
+            choose smallest r such that cumsum(S^2)/sum(S^2) >= t. Reports the
+            distribution of per-lineage ranks. The principled choice -- lineages
+            with simpler structure get small r, complex lineages get higher r,
+            and the user can see how heterogeneous the data is.
+
+        Pair selection: if pair_indices=(I, J) is passed, use those. Else generate
+        n_pairs random pairs (default L). pair_dropout in [0,1) randomly drops a
+        fraction of pairs at fit time.
+        """
         be = self.backend
-        L, K, Gfull = traj_c.shape
+        L_orig, K, Gfull = traj_c.shape
         if gene_panel is not None:
             traj_c = traj_c[:, :, gene_panel]
         G = traj_c.shape[2]
         if G > 4000:
             print(f"  [warn] fusion is G x G with G={G}; consider --gene_panel")
 
+        # (2) lineage pairing -- cancels b_k by trajectory difference
+        if pair_lineages:
+            if pair_indices is None:
+                rng = np.random.default_rng(pair_seed)
+                budget = n_pairs if n_pairs is not None else L_orig
+                I = rng.integers(0, L_orig, size=budget)
+                J = rng.integers(0, L_orig, size=budget)
+                # avoid self-pairing
+                same = (I == J)
+                if same.any():
+                    J[same] = (J[same] + 1) % L_orig
+            else:
+                I, J = (np.asarray(pair_indices[0]),
+                        np.asarray(pair_indices[1]))
+            traj_c = traj_c[I] - traj_c[J]   # (P, K, G); shared b_k cancels
+            print(f"  lineage pairing: {len(I)} difference series "
+                  f"from L={L_orig} lineages")
+
+        # pair / lineage dropout -- subsample for robustness / regularization
+        if pair_dropout > 0:
+            rng = np.random.default_rng(pair_seed + 1)
+            keep = rng.random(traj_c.shape[0]) >= pair_dropout
+            n_kept = int(keep.sum())
+            if n_kept < 2:
+                print(f"  [warn] pair_dropout={pair_dropout} left {n_kept} items; "
+                      f"using all instead")
+            else:
+                traj_c = traj_c[keep]
+                print(f"  pair dropout: keeping {n_kept}/{len(keep)} "
+                      f"({100*n_kept/len(keep):.0f}%) at seed {pair_seed}")
+
+        L = traj_c.shape[0]
+
+        if (explained_variance_threshold is not None and max_rank is not None):
+            print(f"  [warn] both explained_variance_threshold and max_rank set; "
+                  f"using threshold (per-lineage adaptive)")
+
         W_blocks, U_blocks, ranks = [], [], []
         sigma_pre, sigma_post, fit_r2, comp_rhos = [], [], [], []
         for l in range(L):
             Xl = traj_c[l].T
             Xsnap = Xl[:, :-1]
-            DX = Xl[:, 1:] - Xl[:, :-1]
+            DX = Xl[:, 1:] - Xl[:, :-1]                 # (1) time differencing
             U, S, Vt = svd(Xsnap, full_matrices=False)
-            r = int(np.sum(S > rank_tol * (S[0] if S.size else 1.0)))
+            r_avail = int(np.sum(S > rank_tol * (S[0] if S.size else 1.0)))
             n_snap = Xsnap.shape[1]
-            cap = max_rank if max_rank is not None else max(2, n_snap // 2)
-            r = min(r, cap)
+            if explained_variance_threshold is not None:
+                # per-lineage adaptive: smallest r covering threshold of S^2 energy
+                if r_avail == 0:
+                    r = 0
+                else:
+                    cum = np.cumsum(S[:r_avail] ** 2) / (np.sum(S[:r_avail] ** 2) + 1e-12)
+                    r = int(np.searchsorted(cum, explained_variance_threshold) + 1)
+                    r = min(r, r_avail)
+            else:
+                cap = max_rank if max_rank is not None else max(2, n_snap // 2)
+                r = min(r_avail, cap)
             if r == 0:
                 continue
             Ur, Sr, Vtr = U[:, :r], S[:r], Vt[:r, :]
@@ -123,78 +199,63 @@ class FusedOperatorBuilder:
         D_fused = be.matmul(sum_AP, denom_inv)
         fr = np.linalg.matrix_rank(D_fused, tol=1e-6)
 
-        self._report(ranks, ridge, sigma_cap, max_rank, fr, G, sum_P, eps_fuse,
+        self._report(ranks, ridge, sigma_cap, max_rank,
+                     explained_variance_threshold,
+                     fr, G, sum_P, eps_fuse,
                      sigma_pre, sigma_post, fit_r2, comp_rhos)
         rho_val = self._report_propagator(D_fused, G, n_steps_hint)
 
-        # --- EXPLICIT MANUSCRIPT VALIDATION PRINTOUT ---
-        self._report_manuscript_metrics(D_fused, traj_c, rho_val)
-
         return (DiffPlusIOperator(D_fused),
                 {"fused_rank": fr, "G": G, "panel": gene_panel, "rho": rho_val,
-                 "D": D_fused})
-
-    # -- newly added manuscript metric reporting -------------------------------
-    def _report_manuscript_metrics(self, D_fused, traj_c, rho_val):
-        """Calculates and prints the specific empirical metrics needed for the 1-page summary."""
-        try:
-            L, K, G = traj_c.shape
-            n_steps = K - 1
-            
-            print("\n--- 1-PAGER MANUSCRIPT VALIDATIONS ---")
-            
-            # [1] PHYSICS CHECK
-            print("[1] PHYSICS CHECK:")
-            if rho_val is not None:
-                print(f"    Spectral Radius rho(M): {rho_val:.4f}")
-                print(f"    (Bounded amplification confirms non-explosive continuous-time stability)\n")
-            else:
-                print(f"    Spectral Radius unavailable.\n")
-
-            # [2] EXTRACTING CONTROL FORCING & DIMENSIONALITY
-            # Safely cast to numpy for diagnostic math regardless of backend
-            traj_c_np = np.asarray(traj_c)
-            X_raw = traj_c_np[:, :-1, :].reshape(L * n_steps, G).T
-            Y_raw = traj_c_np[:, 1:, :].reshape(L * n_steps, G).T
-            
-            M = np.eye(G) + np.asarray(D_fused)
-            B_estimated = Y_raw - (M @ X_raw)
-            
-            # Extract variance of the forcing vector (b_k)
-            _, S_b, _ = svd(B_estimated, full_matrices=False)
-            variance_explained = (S_b**2) / np.sum(S_b**2)
-            
-            print("[2] CONTROL DIMENSIONALITY (SCREE PLOT VARIANCES):")
-            for i in range(min(8, len(variance_explained))):
-                print(f"    Dim {i+1}: {variance_explained[i]:.4f}")
-            print("    (Expect strict variance collapse after Dimension 4)\n")
-
-            # [3] EMPIRICAL FIT (R^2)
-            mean_B = np.mean(B_estimated, axis=1, keepdims=True)
-            Y_predicted = (M @ X_raw) + mean_B
-            
-            SS_res = np.sum((Y_raw - Y_predicted)**2)
-            SS_tot = np.sum((Y_raw - np.mean(Y_raw, axis=1, keepdims=True))**2)
-            r_squared = 1 - (SS_res / SS_tot)
-            
-            print("[3] EMPIRICAL VALIDATION:")
-            print(f"    Linear Matrix Fit R^2:  {r_squared:.4f}")
-            print("--------------------------------------\n")
-            
-        except Exception as e:
-            print(f"\n[Warning] Manuscript metrics generation failed: {e}\n")
+                 "D": D_fused, "ranks": np.array(ranks),
+                 "fit_r2": np.array(fit_r2)})
 
     # -- diagnostics (unchanged prints) ----------------------------------------
-    def _report(self, ranks, ridge, sigma_cap, max_rank, fr, G, sum_P, eps_fuse,
+    def _report(self, ranks, ridge, sigma_cap, max_rank,
+                explained_variance_threshold,
+                fr, G, sum_P, eps_fuse,
                 sigma_pre, sigma_post, fit_r2, comp_rhos):
         try:
             eig = np.linalg.eigvalsh(sum_P)
             eig = eig[eig > 1e-8]
+            if explained_variance_threshold is not None:
+                rank_desc = f"adaptive (threshold={explained_variance_threshold})"
+            elif max_rank is not None:
+                rank_desc = f"max_rank={max_rank}"
+            else:
+                rank_desc = "max_rank=auto(~snap/2)"
             print(f"  fused over {len(ranks)} lineages (ridge={ridge:g}"
                   f"{', sigma_cap=%g' % sigma_cap if sigma_cap is not None else ''}"
-                  f"{', max_rank=%d' % max_rank if max_rank is not None else ', max_rank=auto(~snap/2)'}); "
+                  f", {rank_desc}); "
                   f"per-lineage rank ~{np.median(ranks) if ranks else 0:.0f}; "
                   f"rank(D_fused)={fr} (G={G})")
+            if ranks and (explained_variance_threshold is not None or len(set(ranks)) > 1):
+                ra = np.array(ranks)
+                qs = np.quantile(ra, [0.05, 0.25, 0.5, 0.75, 0.95])
+                print(f"  per-lineage rank distribution: "
+                      f"min={ra.min()} 5%={qs[0]:.0f} 25%={qs[1]:.0f} "
+                      f"median={qs[2]:.0f} 75%={qs[3]:.0f} 95%={qs[4]:.0f} "
+                      f"max={ra.max()} mean={ra.mean():.1f}")
+                # ASCII histogram across unique ranks (or binned if too many)
+                rmin, rmax = ra.min(), ra.max()
+                if rmax - rmin + 1 <= 20:
+                    counts = np.bincount(ra, minlength=rmax + 1)
+                    total = counts.sum()
+                    print(f"  rank histogram:")
+                    bar_max = max(counts.max(), 1)
+                    for r_val in range(rmin, rmax + 1):
+                        c = counts[r_val]
+                        bar = "#" * int(40 * c / bar_max)
+                        print(f"    r={r_val:>3}: {c:>5} ({100*c/total:>5.1f}%) {bar}")
+                else:
+                    # bin into 20 bins
+                    h, edges = np.histogram(ra, bins=20)
+                    bar_max = max(h.max(), 1)
+                    print(f"  rank histogram (20 bins):")
+                    for i in range(len(h)):
+                        bar = "#" * int(40 * h[i] / bar_max)
+                        print(f"    [{edges[i]:>5.1f}, {edges[i+1]:>5.1f}): "
+                              f"{h[i]:>5} {bar}")
             if sigma_cap is not None and sigma_pre:
                 print(f"  per-lineage propagator sigma_max: "
                       f"pre-cap median={np.median(sigma_pre):.2f} max={np.max(sigma_pre):.2f} "

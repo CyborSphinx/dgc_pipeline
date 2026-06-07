@@ -141,3 +141,159 @@ def forcing_geometry(M, traj_c, panel, Bu_const):
                     cos_median=np.median(ang, axis=1), cos_std=np.std(ang, axis=1),
                     mag_median=np.median(mag, axis=1), mag_std=np.std(mag, axis=1),
                 ))
+
+
+def recover_input_and_validate(M, traj_c, panel, xbar,
+                               n_pairs_holdout=200, lineage_sample=None,
+                               seed=0, verbose=True, **_ignored_kwargs):
+    """
+    Health check for a fitted operator M. Prints (and returns):
+      [A] R^2(M on pair differences) -- strict M test (b cancels in pair diffs).
+      [B] Per-lineage roll-forward R^2 with constant Bu and time-varying bu_k.
+      [C] Centered PCA on per-lineage residuals b^l_k -- forcing dimensionality.
+      [D] ||Bu_const||, residual scatter.
+      [E] Cross-lineage spread on Bu_const direction (validates shared-b).
+
+    Note: per-lineage R^2 in [B] is inflated by the shared trajectory growth
+    that every lineage trivially gets right since pred uses x^l_0. Read [B]
+    together with [E] (per-lineage discrimination = cross-lineage spread of
+    residuals) rather than alone.
+
+    **_ignored_kwargs catches deprecated params like heldout_frac.
+    """
+    tc = traj_c[:, :, panel] if panel is not None else traj_c
+    xb = xbar[panel] if (xbar is not None and panel is not None
+                         and len(xbar) != tc.shape[2]) else xbar
+    L, K, G = tc.shape
+    out = {}
+
+    # --- recover Bu_const and bu_per_step in RAW frame from mean trajectory ---
+    mean_c = tc.mean(axis=0)
+    if xb is not None:
+        X = mean_c + xb[None, :]
+    else:
+        X = mean_c
+        if verbose:
+            print(f"  [warn] xbar is None -- Bu in centered frame "
+                  f"(the A*xbar artifact will leak in)")
+    bu_per_step = np.array([X[k + 1] - M @ X[k] for k in range(K - 1)])
+    Bu_const = bu_per_step.mean(axis=0)
+    resid_std = bu_per_step.std(axis=0)
+    rel_scatter = float(norm(resid_std) / (norm(Bu_const) + 1e-12))
+    out["bu_per_step"] = bu_per_step
+    out["Bu_const"] = Bu_const
+    out["rel_scatter"] = rel_scatter
+
+    if verbose:
+        print(f"  HEALTH CHECK on fitted operator (panel G={G}, L={L} lineages)")
+
+    # --- [A] R^2 of M on pair differences ---
+    rng = np.random.default_rng(seed)
+    n_pairs = max(2, min(n_pairs_holdout, L))
+    Ip = rng.integers(0, L, n_pairs)
+    Jp = rng.integers(0, L, n_pairs)
+    same = (Ip == Jp); Jp[same] = (Jp[same] + 1) % L
+    ss_res = ss_tot = 0.0
+    for p in range(n_pairs):
+        y_traj = tc[Ip[p]] - tc[Jp[p]]
+        pred = (M @ y_traj[:-1].T).T
+        ss_res += norm(y_traj[1:] - pred) ** 2
+        ss_tot += norm(y_traj[1:]) ** 2
+    r2_M_pair = float(1.0 - ss_res / (ss_tot + 1e-12))
+    out["r2_M_on_pair_diffs"] = r2_M_pair
+    if verbose:
+        print(f"\n  [A] R^2(M on pair differences) = {r2_M_pair:+.4f}  "
+              f"({n_pairs} random pairs)")
+
+    # --- subsample lineages for [B], [C], [E] ---
+    if lineage_sample is not None and lineage_sample < L:
+        rng2 = np.random.default_rng(seed + 1)
+        lin_idx = rng2.choice(L, lineage_sample, replace=False)
+    else:
+        lin_idx = np.arange(L)
+    L_use = len(lin_idx)
+    xb_use = xb if xb is not None else np.zeros(G)
+    Mt = M.T
+
+    # --- [B] Per-lineage roll-forward R^2 ---
+    X_init = tc[lin_idx, 0, :] + xb_use[None, :]
+    pred_const = X_init.copy()
+    pred_tv = X_init.copy()
+    ss_res_const = ss_res_tv = ss_tot_lin = 0.0
+    for k in range(K - 1):
+        X_actual = tc[lin_idx, k + 1, :] + xb_use[None, :]
+        pred_const = pred_const @ Mt + Bu_const
+        pred_tv = pred_tv @ Mt + bu_per_step[k]
+        deviation = X_actual - X_init
+        ss_tot_lin += float(np.sum(deviation ** 2))
+        ss_res_const += float(np.sum((X_actual - pred_const) ** 2))
+        ss_res_tv += float(np.sum((X_actual - pred_tv) ** 2))
+    r2_lin_const = float(1.0 - ss_res_const / (ss_tot_lin + 1e-12))
+    r2_lin_tv = float(1.0 - ss_res_tv / (ss_tot_lin + 1e-12))
+    out["r2_lineage_const_Bu"] = r2_lin_const
+    out["r2_lineage_tv_bu"] = r2_lin_tv
+    if verbose:
+        print(f"\n  [B] Per-lineage roll-forward R^2 ({L_use} lineages):")
+        print(f"    constant Bu:        R^2 = {r2_lin_const:+.4f}")
+        print(f"    time-varying bu_k:  R^2 = {r2_lin_tv:+.4f}")
+
+    # --- [C] Centered PCA on per-lineage forcings (b^l_k vectors) ---
+    sum_f = np.zeros(G, dtype=np.float64)
+    C_uncentered = np.zeros((G, G), dtype=np.float64)
+    N_total = 0
+    for k in range(K - 1):
+        F_k = (tc[lin_idx, k + 1, :] + xb_use[None, :]) \
+              - (tc[lin_idx, k, :] + xb_use[None, :]) @ Mt
+        sum_f += F_k.sum(axis=0)
+        C_uncentered += F_k.T @ F_k
+        N_total += F_k.shape[0]
+    mean_f = sum_f / N_total
+    C_centered = C_uncentered - N_total * np.outer(mean_f, mean_f)
+    eigvals = np.linalg.eigvalsh(C_centered)[::-1]
+    eigvals = np.maximum(eigvals, 0.0)
+    total_var = float(eigvals.sum())
+    explained = eigvals / (total_var + 1e-12)
+    sv = np.sqrt(eigvals)
+    sv_norm = sv / (sv[0] + 1e-12)
+    out["forcing_pca_sv"] = sv
+    out["forcing_pca_explained"] = explained
+    if verbose:
+        print(f"\n  [C] Centered PCA on {N_total} per-lineage b^l_k vectors:")
+        cum = 0.0
+        for i in range(min(8, len(sv))):
+            cum += explained[i]
+            print(f"    PC[{i+1}]  sv_norm={sv_norm[i]:.4f}  "
+                  f"explains {explained[i]*100:5.2f}%  cum={cum*100:5.2f}%")
+        print(f"    Top 4 cumulative: {explained[:4].sum()*100:.1f}%   "
+              f"Top 8: {explained[:8].sum()*100:.1f}%")
+
+    # --- [D] Bu_const + scatter ---
+    if verbose:
+        print(f"\n  [D] ||Bu_const|| = {norm(Bu_const):.4f}   "
+              f"residual scatter ||std||/||mean|| = {rel_scatter:.3f}")
+
+    # --- [E] Cross-lineage spread on Bu_const direction ---
+    if norm(Bu_const) < 1e-12:
+        if verbose:
+            print(f"\n  [E] Bu_const ~ 0 -- skipping cross-lineage spread")
+        return out
+    u_hat = Bu_const / norm(Bu_const)
+    Xa_sub = tc[lin_idx] + xb_use[None, None, :]
+    res_std = np.empty(K - 1)
+    st_std  = np.empty(K - 1)
+    for k in range(K - 1):
+        Rk = Xa_sub[:, k + 1, :] - Xa_sub[:, k, :] @ Mt
+        proj_k = Rk @ u_hat
+        Sk = Xa_sub[:, k, :]
+        state_proj_k = (Sk - Sk.mean(axis=0)) @ u_hat
+        res_std[k] = proj_k.std()
+        st_std[k]  = state_proj_k.std()
+    ratio_med = float(np.median(res_std) / (np.median(st_std) + 1e-12))
+    out["cross_lineage_ratio_median"] = ratio_med
+    if verbose:
+        print(f"\n  [E] Cross-lineage spread on Bu_const direction:")
+        print(f"    state std median  = {np.median(st_std):.3f}")
+        print(f"    resid std median  = {np.median(res_std):.3f}")
+        print(f"    ratio (res/state) median = {ratio_med:.3f}")
+
+    return out

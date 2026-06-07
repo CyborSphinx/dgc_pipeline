@@ -56,7 +56,8 @@ class TargetBuilder:
             self._rows = np.array([], int)
             return self._rows
         obs = np.asarray(self.A.obs_names)
-        mask = np.array([c in ipsc_ids for c in obs])
+        # Strip trailing suffixes before checking
+        mask = np.array([c.split('_')[0] in ipsc_ids for c in obs])
         if self.cell_days is not None and self.final_day is not None:
             day_of = {c: self.cell_days.get(c, np.nan) for c in obs}
             dvals = np.array([day_of[c] for c in obs])
