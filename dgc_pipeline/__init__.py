@@ -30,7 +30,7 @@ from .fusion import FusedOperatorBuilder, DGCOperatorBuilder
 from .targets import TargetBuilder
 from .trajectory import TrajectoryBuilder
 from .diagnostics import (fusion_vs_averaging, forcing_svd, forcing_geometry,
-                          recover_input_and_validate)
+                          recover_input_and_validate, multi_horizon_comparison)
 from .interleaved import InterleavedFusion, make_response_sum, tikhonov_deconvolve
 from .bmatrix import NormanBBuilder, HUMAN_TO_MOUSE_OSKM
 from .scoring import (Scorer, BOnlyScorer, DynamicsScorer,
@@ -45,7 +45,7 @@ __all__ = [
     "Scorer", "BOnlyScorer", "DynamicsScorer", "ControlBestDayScorer",
     "ranks_of_known", "precision_at_k",
     "fusion_vs_averaging", "forcing_svd", "forcing_geometry",
-    "recover_input_and_validate",
+    "recover_input_and_validate", "multi_horizon_comparison",
     "InterleavedFusion", "make_response_sum", "tikhonov_deconvolve",
     "NormanBBuilder", "HUMAN_TO_MOUSE_OSKM",
 ]

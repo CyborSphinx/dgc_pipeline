@@ -143,40 +143,36 @@ def forcing_geometry(M, traj_c, panel, Bu_const):
                 ))
 
 
-def recover_input_and_validate(M, traj_c, panel, xbar,
+def recover_input_and_validate(M, traj_c, panel=None,
                                n_pairs_holdout=200, lineage_sample=None,
                                seed=0, verbose=True, **_ignored_kwargs):
     """
-    Health check for a fitted operator M. Prints (and returns):
+    Health check for a fitted operator M. All computations in CENTERED frame.
+
+    Prints (and returns):
       [A] R^2(M on pair differences) -- strict M test (b cancels in pair diffs).
       [B] Per-lineage roll-forward R^2 with constant Bu and time-varying bu_k.
       [C] Centered PCA on per-lineage residuals b^l_k -- forcing dimensionality.
-      [D] ||Bu_const||, residual scatter.
-      [E] Cross-lineage spread on Bu_const direction (validates shared-b).
+      [D] ||Bu_const_c||, residual scatter (centered frame).
+      [E] Cross-lineage spread on Bu_const direction.
 
-    Note: per-lineage R^2 in [B] is inflated by the shared trajectory growth
-    that every lineage trivially gets right since pred uses x^l_0. Read [B]
-    together with [E] (per-lineage discrimination = cross-lineage spread of
-    residuals) rather than alone.
+    M: (G, G) operator (fit on centered data, frame-invariant)
+    traj_c: (L, K, G) CENTERED trajectories
+    panel: optional gene-index subset
 
-    **_ignored_kwargs catches deprecated params like heldout_frac.
+    Note: per-lineage R^2 in [B] is inflated by shared trajectory growth that
+    every lineage trivially gets right (pred uses x^l_0). Read [B] together
+    with [E].
+
+    **_ignored_kwargs catches deprecated params (xbar, heldout_frac).
     """
     tc = traj_c[:, :, panel] if panel is not None else traj_c
-    xb = xbar[panel] if (xbar is not None and panel is not None
-                         and len(xbar) != tc.shape[2]) else xbar
     L, K, G = tc.shape
     out = {}
 
-    # --- recover Bu_const and bu_per_step in RAW frame from mean trajectory ---
-    mean_c = tc.mean(axis=0)
-    if xb is not None:
-        X = mean_c + xb[None, :]
-    else:
-        X = mean_c
-        if verbose:
-            print(f"  [warn] xbar is None -- Bu in centered frame "
-                  f"(the A*xbar artifact will leak in)")
-    bu_per_step = np.array([X[k + 1] - M @ X[k] for k in range(K - 1)])
+    # --- recover Bu_const and bu_per_step in CENTERED frame from mean trajectory ---
+    mean_c = tc.mean(axis=0)                              # (K, G) centered mean
+    bu_per_step = np.array([mean_c[k + 1] - M @ mean_c[k] for k in range(K - 1)])
     Bu_const = bu_per_step.mean(axis=0)
     resid_std = bu_per_step.std(axis=0)
     rel_scatter = float(norm(resid_std) / (norm(Bu_const) + 1e-12))
@@ -185,9 +181,9 @@ def recover_input_and_validate(M, traj_c, panel, xbar,
     out["rel_scatter"] = rel_scatter
 
     if verbose:
-        print(f"  HEALTH CHECK on fitted operator (panel G={G}, L={L} lineages)")
+        print(f"  HEALTH CHECK on fitted operator (G={G}, L={L} lineages, centered)")
 
-    # --- [A] R^2 of M on pair differences ---
+    # --- [A] R^2 of M on pair differences (centered; xbar cancels in diff anyway) ---
     rng = np.random.default_rng(seed)
     n_pairs = max(2, min(n_pairs_holdout, L))
     Ip = rng.integers(0, L, n_pairs)
@@ -212,38 +208,36 @@ def recover_input_and_validate(M, traj_c, panel, xbar,
     else:
         lin_idx = np.arange(L)
     L_use = len(lin_idx)
-    xb_use = xb if xb is not None else np.zeros(G)
     Mt = M.T
 
-    # --- [B] Per-lineage roll-forward R^2 ---
-    X_init = tc[lin_idx, 0, :] + xb_use[None, :]
-    pred_const = X_init.copy()
-    pred_tv = X_init.copy()
+    # --- [B] Per-lineage roll-forward R^2 (CENTERED frame) ---
+    y_init = tc[lin_idx, 0, :]                            # (L_use, G) centered initial
+    pred_const = y_init.copy()
+    pred_tv = y_init.copy()
     ss_res_const = ss_res_tv = ss_tot_lin = 0.0
     for k in range(K - 1):
-        X_actual = tc[lin_idx, k + 1, :] + xb_use[None, :]
+        y_actual = tc[lin_idx, k + 1, :]
         pred_const = pred_const @ Mt + Bu_const
         pred_tv = pred_tv @ Mt + bu_per_step[k]
-        deviation = X_actual - X_init
+        deviation = y_actual - y_init
         ss_tot_lin += float(np.sum(deviation ** 2))
-        ss_res_const += float(np.sum((X_actual - pred_const) ** 2))
-        ss_res_tv += float(np.sum((X_actual - pred_tv) ** 2))
+        ss_res_const += float(np.sum((y_actual - pred_const) ** 2))
+        ss_res_tv += float(np.sum((y_actual - pred_tv) ** 2))
     r2_lin_const = float(1.0 - ss_res_const / (ss_tot_lin + 1e-12))
     r2_lin_tv = float(1.0 - ss_res_tv / (ss_tot_lin + 1e-12))
     out["r2_lineage_const_Bu"] = r2_lin_const
     out["r2_lineage_tv_bu"] = r2_lin_tv
     if verbose:
-        print(f"\n  [B] Per-lineage roll-forward R^2 ({L_use} lineages):")
+        print(f"\n  [B] Per-lineage roll-forward R^2 ({L_use} lineages, centered):")
         print(f"    constant Bu:        R^2 = {r2_lin_const:+.4f}")
         print(f"    time-varying bu_k:  R^2 = {r2_lin_tv:+.4f}")
 
-    # --- [C] Centered PCA on per-lineage forcings (b^l_k vectors) ---
+    # --- [C] Centered PCA on per-lineage forcings (b^l_k vectors, centered) ---
     sum_f = np.zeros(G, dtype=np.float64)
     C_uncentered = np.zeros((G, G), dtype=np.float64)
     N_total = 0
     for k in range(K - 1):
-        F_k = (tc[lin_idx, k + 1, :] + xb_use[None, :]) \
-              - (tc[lin_idx, k, :] + xb_use[None, :]) @ Mt
+        F_k = tc[lin_idx, k + 1, :] - tc[lin_idx, k, :] @ Mt
         sum_f += F_k.sum(axis=0)
         C_uncentered += F_k.T @ F_k
         N_total += F_k.shape[0]
@@ -267,24 +261,24 @@ def recover_input_and_validate(M, traj_c, panel, xbar,
         print(f"    Top 4 cumulative: {explained[:4].sum()*100:.1f}%   "
               f"Top 8: {explained[:8].sum()*100:.1f}%")
 
-    # --- [D] Bu_const + scatter ---
+    # --- [D] Bu_const + scatter (centered frame) ---
     if verbose:
-        print(f"\n  [D] ||Bu_const|| = {norm(Bu_const):.4f}   "
+        print(f"\n  [D] ||Bu_const_c|| = {norm(Bu_const):.4f}   "
               f"residual scatter ||std||/||mean|| = {rel_scatter:.3f}")
 
-    # --- [E] Cross-lineage spread on Bu_const direction ---
+    # --- [E] Cross-lineage spread on Bu_const direction (centered) ---
     if norm(Bu_const) < 1e-12:
         if verbose:
             print(f"\n  [E] Bu_const ~ 0 -- skipping cross-lineage spread")
         return out
     u_hat = Bu_const / norm(Bu_const)
-    Xa_sub = tc[lin_idx] + xb_use[None, None, :]
+    tc_sub = tc[lin_idx]                                  # centered
     res_std = np.empty(K - 1)
     st_std  = np.empty(K - 1)
     for k in range(K - 1):
-        Rk = Xa_sub[:, k + 1, :] - Xa_sub[:, k, :] @ Mt
+        Rk = tc_sub[:, k + 1, :] - tc_sub[:, k, :] @ Mt
         proj_k = Rk @ u_hat
-        Sk = Xa_sub[:, k, :]
+        Sk = tc_sub[:, k, :]
         state_proj_k = (Sk - Sk.mean(axis=0)) @ u_hat
         res_std[k] = proj_k.std()
         st_std[k]  = state_proj_k.std()
@@ -297,3 +291,148 @@ def recover_input_and_validate(M, traj_c, panel, xbar,
         print(f"    ratio (res/state) median = {ratio_med:.3f}")
 
     return out
+
+
+def multi_horizon_comparison(traj_c, M, M_pure_dmd=None, panel=None,
+                              horizons=None, seed=0, holdout_frac=0.0,
+                              verbose=True):
+    """
+    Compare prediction quality across horizons for five models. CENTERED frame.
+
+      (1) M + const Bu        : paired-fit M, time-averaged residual
+      (2) M + tv b_t          : paired-fit M, per-step empirical residual
+      (3) pure forcing const  : y_{k+1} = y_k + db_const  (NO operator)
+      (4) pure forcing tv     : y_{k+1} = y_k + db_t      (NO operator)
+      (5) pure DMD (no b)     : y_{k+1} = M_pure_dmd y_k  (no explicit forcing)
+
+    Two metrics at each horizon h:
+
+      R^2(h) = 1 - Σ_l ||y^l_h - pred^l_h||^2 / Σ_l ||y^l_h - mean_l(y^l_h)||^2
+        Denominator is cross-lineage VARIANCE at step h. Standard per-horizon R^2;
+        does NOT artificially grow with horizon (unlike the older
+        ||y^l_h - y^l_0||^2 denominator, which inflates R^2 at long h).
+
+      RMSE(h) = sqrt(mean_l ||y^l_h - pred^l_h||^2)
+        Direct error magnitude in centered state units. SHOULD grow with h
+        (error compounding); inspect this to verify the comparison is honest.
+
+    holdout_frac:
+      0.0 -> in-sample evaluation. tv baselines are TRIVIALLY high because b_t
+        IS the mean per-step change of the same data we're predicting.
+      0.2 -> hold out 20% of lineages. b_t, Bu_const, db_const, db_t are
+        estimated from the TRAINING 80%, then predictions are evaluated on
+        the held-out 20%. This is the honest out-of-sample comparison; tv b_t
+        no longer trivially wins.
+
+    The pure-DMD operator M_pure_dmd is used as-is (fit upstream by the user).
+    If you want a fully OOS DMD comparison, refit M_pure_dmd on the training
+    set externally and pass it here.
+
+    Returns dict with keys 'R2', 'RMSE', 'train_idx', 'test_idx'.
+    """
+    tc = traj_c[:, :, panel] if panel is not None else traj_c
+    L, K, G = tc.shape
+    if horizons is None:
+        horizons = [h for h in (1, 2, 4, 8, 16, 32, 36) if h < K]
+
+    # ----- train/test split for OOS evaluation of b-derived quantities ------
+    rng = np.random.default_rng(seed)
+    if holdout_frac > 0.0:
+        n_test = max(1, int(holdout_frac * L))
+        test_idx = rng.choice(L, n_test, replace=False)
+        train_mask = np.ones(L, dtype=bool)
+        train_mask[test_idx] = False
+        train_idx = np.where(train_mask)[0]
+    else:
+        train_idx = np.arange(L)
+        test_idx = np.arange(L)
+
+    tc_train = tc[train_idx]
+    tc_test = tc[test_idx]
+    L_test = tc_test.shape[0]
+
+    # ----- recover all b-related quantities from TRAINING data only ---------
+    mean_c_train = tc_train.mean(axis=0)                  # (K, G)
+    bu_per_step = np.array([mean_c_train[k + 1] - M @ mean_c_train[k]
+                            for k in range(K - 1)])
+    Bu_const = bu_per_step.mean(axis=0)
+    db_per_step = np.diff(mean_c_train, axis=0)
+    db_const = db_per_step.mean(axis=0)
+
+    Mt = M.T
+    M_dmd_T = M_pure_dmd.T if M_pure_dmd is not None else None
+
+    def roll(M_op_T, b_step, b_const):
+        y = np.empty((L_test, K, G))
+        y[:, 0, :] = tc_test[:, 0, :]
+        for k in range(K - 1):
+            if M_op_T is not None:
+                y[:, k + 1, :] = y[:, k, :] @ M_op_T
+            else:
+                y[:, k + 1, :] = y[:, k, :]
+            if b_step is not None:
+                y[:, k + 1, :] += b_step[k]
+            elif b_const is not None:
+                y[:, k + 1, :] += b_const
+        return y
+
+    models = {
+        "M + const Bu":        roll(Mt, None, Bu_const),
+        "M + tv b_t":          roll(Mt, bu_per_step, None),
+        "pure forcing const":  roll(None, None, db_const),
+        "pure forcing tv":     roll(None, db_per_step, None),
+    }
+    if M_pure_dmd is not None:
+        models["pure DMD (no b)"] = roll(M_dmd_T, None, None)
+
+    # ----- metrics --------------------------------------------------------
+    results_r2 = {name: {} for name in models}
+    results_rmse = {name: {} for name in models}
+    var_check = {}  # cross-lineage variance at each h (for sanity)
+    for h in horizons:
+        y_actual_h = tc_test[:, h, :]
+        mean_h = y_actual_h.mean(axis=0)
+        ss_tot_var = float(np.sum((y_actual_h - mean_h) ** 2))     # cross-lin var
+        var_check[h] = ss_tot_var / max(L_test, 1)
+        for name, y_pred in models.items():
+            err = y_actual_h - y_pred[:, h, :]
+            ss_res = float(np.sum(err ** 2))
+            results_r2[name][h] = 1.0 - ss_res / (ss_tot_var + 1e-12)
+            results_rmse[name][h] = float(np.sqrt(np.mean(err ** 2)))
+
+    if verbose:
+        label = ("OOS" if holdout_frac > 0 else "IN-SAMPLE")
+        print(f"  MULTI-HORIZON COMPARISON  ({L_test} test lineages, {label}, "
+              f"centered frame)")
+        if holdout_frac == 0:
+            print(f"  WARNING: in-sample. tv b_t baselines are trivially ~1.0 "
+                  f"because b_t IS the data's mean per-step change.")
+            print(f"  Use holdout_frac=0.2 for an honest OOS comparison.\n")
+        else:
+            print(f"  b_t / Bu_const / db_* estimated from {len(train_idx)} "
+                  f"training lineages; evaluated on {L_test} held-out.\n")
+
+        print(f"  R^2(h) = 1 - Σ_l ||y_h - pred||^2 / Σ_l ||y_h - mean_l(y_h)||^2")
+        print(f"  (cross-lineage variance denominator; does NOT inflate with h)\n")
+        header = "  " + f"{'model':<24}" + "  ".join(f"h={h:>3}" for h in horizons)
+        print(header)
+        for name in models:
+            row = "  ".join(f"{results_r2[name][h]:+.3f}" for h in horizons)
+            print(f"  {name:<24}{row}")
+
+        print(f"\n  RMSE(h) (absolute error, centered state units; SHOULD grow w/ h)\n")
+        print(header)
+        for name in models:
+            row = "  ".join(f"{results_rmse[name][h]:>6.3f}" for h in horizons)
+            print(f"  {name:<24}{row}")
+
+        # sanity: how does cross-lineage variance evolve with h?
+        print(f"\n  cross-lineage std(y_h) at each h (sanity check):")
+        for h in horizons:
+            print(f"    h={h:>3}: std={np.sqrt(var_check[h]):.4f}")
+
+    return {"R2": results_r2, "RMSE": results_rmse,
+            "train_idx": train_idx, "test_idx": test_idx,
+            "var_check": var_check}
+
+
